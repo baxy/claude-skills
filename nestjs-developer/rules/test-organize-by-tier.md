@@ -1,0 +1,96 @@
+---
+title: Organize Tests by Tier
+impact: HIGH
+impactDescription: Every test has one obvious home, and CI runs exactly what it can run
+tags: testing, organization, vitest, jest, coverage, ci
+---
+
+## Organize Tests by Tier
+
+A test's tier is defined by **what it needs in order to run**, because that alone decides whether CI can run it. Each tier is one directory under `test/`, and the test runner's config selects it by path. **No test lives in `src/`.**
+
+The tiers are the same with either runner. The config files and scripts that implement them are in `references/test-runner-vitest.md` (ESM projects, the NestJS 12 default) and `references/test-runner-jest.md` (CommonJS projects); use the one for the runner in the project's `package.json`.
+
+| Tier | Needs | Script | Directory |
+|---|---|---|---|
+| Unit | nothing: no Nest container, no I/O outside the process and the repository | `test:unit` | `test/unit/` |
+| E2E | nothing: an in-process Nest module with mocked repositories | `test:e2e` | `test/e2e/` |
+| Database | a migrated database, no HTTP | `test:db` | `test/db/` |
+| Integration | the API running against its real stack | `test:integration` | `test/integration/` |
+
+"E2E" means what NestJS means by it: the real controller and service built with `Test.createTestingModule` and driven over HTTP in-process (see `test-use-testing-module`), not a whole deployed system. A package carries only the tiers it needs, under these names.
+
+**Where a test goes** - ask one question: does the subject have a dependency Nest would inject?
+
+- **No** (a pure function, a DTO's validation decorators, a type guard): `test/unit/`, constructed directly. Large combinatorial logic (price calculation, state machines) stays here. A loopback server the spec starts itself, or a file of the repository it reads (`.env.example`), is not I/O in this sense; a database, a network service or Redis is.
+- **No, but it can only be observed through the Nest container** (a Swagger decorator, read from the document `SwaggerModule.createDocument()` builds; a module's wiring): `test/e2e/`.
+- **Yes** (a service, controller, guard, interceptor): `test/e2e/`, through its route.
+
+**Layout and naming:**
+
+- Every tier mirrors `src/`: one folder per module, whatever its spec count (`test/unit/order/`, `test/e2e/order/`). A suite that belongs to no one module (a role matrix over every route) gets a folder named for its concern beside them (`test/integration/access/`).
+- **Helpers live under `test/`, never in `src/`**, where they would ship in the build. Which folder depends on whether they build on the app's code:
+  - `test/helpers/` holds what builds the app or its parts in-process, and the stand-ins of outside systems, whichever tier uses them, one or several: `createTestApp()` and the test auth guard (e2e), fakes and SDK mocks (unit and e2e), the database helpers (the database tier), a provider's stand-in (local runs and the integration tier, see `test-integration-suites`).
+  - `test/integration/helpers/` holds the integration tier's own: its API client and the operator actions it needs (see `test-integration-suites`). That tier drives the running API from outside, over HTTP, so its helpers build no part of the app, and keeping them apart keeps an in-process helper out of it.
+  - A file the runner loads for one tier (`global-setup.ts`) stays at that tier's root.
+- E2E: one spec per controller, which covers each of its routes: `{resource}.spec.ts` for public routes and `{resource}.internal.spec.ts` for internal ones. **Never two specs over the same routes** - that is how a route ends up untested while each file assumes the other covers it. Several controllers exposing one resource through different parents share one spec. A guard or interceptor driven through probe routes (see `test-guards-and-interceptors`) gets one spec named after its source file: `src/auth/guards/auth-roles.guard.ts` → `test/e2e/auth/auth-roles.guard.spec.ts`. So does a module with no controller, tested through the service it exports: `src/mail/services/mail.service.ts` → `test/e2e/mail/mail.service.spec.ts`.
+- Unit: the spec takes the source file's name under its module folder, dropping the type folder: `src/order/utils/calculate-order-total.ts` → `test/unit/order/calculate-order-total.spec.ts`.
+- Keep the full name on the file (`order/order.spec.ts`, never `order/public.spec.ts`): failures are read in the runner's output without the path.
+- Route blocks are `describe('VERB /path')`; direct service blocks are `describe('ServiceName.method')`, never the bare method name. Behavior that belongs to no route (the `x-request-id` header, the response envelope) gets a block named after the behavior, in the spec of the file that implements it. Positives sit beside their negatives. Only authorization and isolation suites may group by caller identity instead of route.
+- Do not add tests for a method nothing calls: a test implies a contract someone depends on.
+
+**Scripts and coverage:**
+
+- Every package has a `test` script running its stack-free tiers (`test:unit && test:e2e`). Filtered runs such as `pnpm -r --if-present run test` silently skip a package without one and report green having run nothing.
+- `test:db` and `test:integration` are deliberately not part of `test`; developers run them before a PR that touches services, entities or migrations.
+- Measure coverage in **one** run over the stack-free tiers (Vitest projects or a Jest `projects` config). Separate runs cannot be added up because tiers overlap. Exclude only what holds no logic: `main.ts`, which only starts the process, and generated code. Module files and `config/` are measured: they hold logic (`ApiModule.setup()`, the factories that map a config namespace into a module's options, a config file's defaults and parsing), and excluding them hides it. Do not enforce a threshold; use the number to find gaps.
+
+**Incorrect (tests mixed into src, tiers by habit, one spec per module):**
+
+```typescript
+src/
+└── user/
+    ├── user.service.ts
+    ├── user.service.spec.ts        // test in src/
+    ├── user.controller.spec.ts     // second spec over the same routes as user.e2e-spec.ts
+    └── user.e2e-spec.ts            // needs a database, yet runs in `test`
+
+// package.json
+"scripts": {
+  "test": "vitest run"               // runs everything, including tests that need a database
+}
+```
+
+**Correct (one directory per tier, mirroring src):**
+
+```typescript
+test/
+├── unit/
+│   └── user/
+│       ├── build-display-name.spec.ts       // src/user/utils/build-display-name.ts
+│       └── create-user.dto.spec.ts          // DTO validation, no Nest container
+├── e2e/
+│   └── user/
+│       ├── user.spec.ts                    // all public /users routes, real service
+│       └── user.internal.spec.ts           // /internal/users routes
+├── db/
+│   └── user/
+│       └── user-constraints.spec.ts        // unique and check constraints
+├── integration/
+│   ├── helpers/                             // the API client, operator actions: no part of the app
+│   └── user/
+│       └── user.spec.ts
+└── helpers/                                 // in-process scaffolding of any tier: create-test-app.ts, test-auth.guard.ts, fakes, database.ts
+
+// package.json
+"scripts": {
+  "test": "...",              // test:unit + test:e2e
+  "test:unit": "...",
+  "test:e2e": "...",
+  "test:db": "...",           // one file at a time
+  "test:integration": "...",  // one file at a time
+  "test:coverage": "..."      // one run over unit + e2e
+}
+```
+
+Reference: [NestJS Testing](https://docs.nestjs.com/fundamentals/testing)
